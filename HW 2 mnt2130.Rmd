@@ -1,0 +1,280 @@
+---
+title: "P8106 Homework 2"
+author: 'Mindy Tran mnt2130'
+date: "3/5/2023"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    toc: yes
+    toc_depth: 3
+  header-includes:
+    -\usepackage{fancyhdr}
+    -\usepackage{lipsum}
+    -\pagestyle{fancy}
+    -\fancyhead[R]{\thepage}
+    -\fancypagestyle{plain}{\pagestyle{fancy}}
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(viridis)
+library(caret)
+library(GGally)
+library(gridExtra)
+library(nlme)
+library(mgcv)
+library(earth)
+library(pdp)
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.align = "center")
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
+options(
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis"
+)
+scale_colour_discrete = scale_colour_viridis_d
+scale_fill_discrete = scale_fill_viridis_d
+```
+This reads the CSV file, cleans the variables names and eliminates any missing data.
+
+```{r data import and cleaning}
+set.seed(2132)
+college_data = read_csv("./Data/College.csv") %>% 
+  janitor::clean_names() %>% 
+  na.omit() %>% 
+  relocate("outstate", .after = "grad_rate") %>% 
+  select(-college)
+```
+
+This next step will partition the data into training (80% of data) and test (20%) data sets and create matrices of the training and testing data frame for further analysis. 
+
+```{r partition}
+indexTrain = createDataPartition(y = college_data$outstate,
+                                 p = 0.8,
+                                 list = FALSE)
+training_df = college_data[indexTrain, ]
+testing_df = college_data[-indexTrain, ]
+
+x_train = model.matrix(outstate~.,training_df)[, -1]
+y_train = training_df$outstate
+
+x_test <- model.matrix(outstate~.,testing_df)[, -1]
+y_test <- testing_df$outstate
+```
+
+
+## Part A: Smoothing Spline Model
+
+Fit smoothing spline models using `perc_alumni` as the only predictor of `Outstate` for a range of degrees of freedom. 
+
+``` {r smooth spline}
+
+# This code fits a smoothing spline model for perc_alumni as a predictor of outstate
+fit_ss = smooth.spline(training_df$perc_alumni, training_df$outstate)
+
+# This outputs the optimal degrees of freedom from the cross-validation
+fit_ss$df
+
+alumni_grid = seq(from = 2, to = 64, by = 1)
+pred_ss_grid = predict(fit_ss, x = alumni_grid)
+pred_ss_grid_df = data.frame(predicted = pred_ss_grid$y,
+                                        perc_alumni = alumni_grid)
+p = ggplot(data = testing_df, aes(x = perc_alumni, y = outstate)) +
+     geom_point(color = rgb(.2, .4, .2, .5)) 
+
+p_line = p + geom_line(aes(x = perc_alumni, y = predicted), data = pred_ss_grid_df,
+              color = rgb(.8, .1, .1, 1)) + theme_bw()
+
+p_line
+
+# Now we can use it on the test data
+
+pred_ss_testing = predict(fit_ss, x = testing_df$perc_alumni)
+pred_ss_testing_df = data.frame(predicted = pred_ss_testing$y,
+                                           perc_alumni = testing_df$perc_alumni)
+predicted_plot = p + geom_line(aes(x = perc_alumni, y = predicted), data = pred_ss_testing_df,
+          color = rgb(.8, .1, .1, 1)) + theme_bw()
+
+```
+
+This is the smoothing spline model using `perc_alumni` as the sole predictor for `outstate` using the optimal degrees of freedom (df=2.00024) outputted from the generalized cross validation. 
+
+Now we will fit a smoothing spline model for a range of degrees of freedom: 
+
+```{r range of dfs }
+# Smoothing Spline Model with Range of DFs 
+spline_range = function(degree){
+  
+  spline_fit = smooth.spline(training_df$perc_alumni, training_df$outstate, df = degree)
+  
+  spline_pred = predict(spline_fit, x = alumni_grid)
+  
+  spline_df = data.frame(predicted = spline_pred$y,
+                         perc_alumni = alumni_grid,
+                         df = degree)
+}
+
+# Now we can run our spline function for DF values 2 through 10
+datalist = list()
+for (i in 2:10) {
+  datalist[[i]] = spline_range(i)
+}
+all_data = do.call(rbind, datalist) %>% 
+  as.data.frame()
+
+# Plot for range of degree of freedom where red line represents optimal DF 
+
+plot_range = p + 
+  geom_line(aes(x = perc_alumni, y = predicted, group = df, color = df), data = all_data) + 
+  geom_line(aes(x = perc_alumni, y = predicted), data = pred_ss_testing_df,
+          color = rgb(.8, .1, .1, 1))
+
+plot_range
+
+```
+
+When we overlay the models generated from different degree of freedoms, the model fittings are generally clustered and we see that with around 2-3  degree of freedoms, our model appears to fit more linear as represented by the purple lines but the lines (blue, green, yellow) starts to wiggle just a tiny bit when generated with higher degree of freedoms, suggesting slight potential over-fitting but not too much. 
+
+
+## Part B: Generalized Additive Model
+
+```{r}
+set.seed(2132)
+ctrl1 = trainControl(method = "cv", number = 10)
+
+sapply(x_train %>% as.data.frame(), n_distinct)
+
+#None of the predictors take on less than 10 values, thus we can proceed using the caret package, since we ensured that it won't result in loss of flexibility
+
+# We can now run GAM using the caret package and use automatic feature selection
+gam = train(x_train, y_train,
+                method = "gam",
+                tuneGrid = data.frame(method = "GCV.Cp",
+                                      select = c(TRUE, FALSE)),
+                trControl = ctrl1)
+
+# This outputs the parameters which fit the best model
+gam$bestTune
+gam$finalModel
+
+
+# This outputs the final model with the effective degree of freedoms 
+summary(gam)
+
+# Plot of the GAM Model 
+
+par(mar = c(1,1,1,1))
+par(mfrow = c(4, 4))
+plot(gam$finalModel, residuals = TRUE, all.terms = TRUE, shade = TRUE, shade.col = 2)
+
+# Now we calculate the training and test MSE and RMSE of the optimized model 
+
+#training MSE
+gam_train_MSE = mean((y_train - predict(gam))^2)
+gam_train_MSE
+
+gam_train_RMSE = sqrt(gam_train_MSE)
+gam_train_RMSE
+
+#test MSE
+
+test_pred = predict(gam, x_test)
+
+gam_test_MSE = mean((y_test - test_pred)^2)
+gam_test_MSE
+
+gam_test_RMSE = sqrt(gam_test_MSE)
+gam_test_RMSE
+
+```
+
+The optimal GAM model does include all predictors: 
+s(perc_alumni) + s(terminal) + s(books) + s(top10perc) + s(grad_rate) + s(ph_d) + s(top25perc) + s(s_f_ratio) + s(personal) + s(p_undergrad) + s(enroll) + s(room_board) + s(accept) + s(f_undergrad) + s(apps) + s(expend). 
+
+6 variables: terminal, top10perc, top25perc, personal, p_undergrad, enroll, all have 1 degree of freedom, which corresponds by their
+straight line and confirmed as such in our plots. Variables with 2 degrees of freedom are incorporated as quadratics, while variables with 3 DFs are incorporated as cubic functions. perc_alumni, enroll, room_board, f_undergrad, and expend are the most significant smooth terms. 
+
+Generating a model using all predictors, the optimized model when used on the *training data* obtains MSE = 2251375 with RMSE= 1500.458 and when used on the *test data* obtains MSE= 3364712 and an RMSE= 1834.315.
+
+
+## Part C: Multivariate Adaptive Regression Spline Model
+
+
+
+Now we'll train a MARS model with all predictors from the college dataset. 
+
+```{r MARS}
+set.seed(2132)
+ctrl1 = trainControl(method = "cv", number = 10)
+# Generate grid of tuning parameters
+mars_grid = expand.grid(degree = 1:3, 
+                         nprune = 2:25)
+# Fit the MARS model
+mars = train(x_train, y_train,
+                  method = "earth",
+                  tuneGrid = mars_grid,
+                  trControl = ctrl1)
+mars$bestTune
+
+#To minimize RMSE, we choose the model with 1 degree of freedom and 18 hinge functions 
+
+summary(mars$finalModel)
+
+# We will use 10 of the 16 predictors
+
+coef(mars$finalModel) 
+
+# Training MSE and RMSE
+mars_train_MSE = mean((y_train - predict(mars))^2)
+mars_train_MSE
+
+mars_train_RMSE = sqrt(mars_train_MSE)
+mars_train_RMSE
+
+# Test MSE and RMSE
+test_pred_mars = predict(mars, x_test)
+
+mars_test_MSE = mean((y_test - test_pred_mars)^2)
+mars_test_MSE
+
+mars_test_RMSE = sqrt(mars_test_MSE)
+mars_test_RMSE
+
+```
+
+Now that we have trained a MARS model using all predictors,  the optimal model achieves MSE= 2421360 (RMSE=1556.1) when the model is applied to the training data and an MSE= 3460709 (RMSE =1860.3)  applied  to the partitioned test data.  The final model minimizes RMSEby using one product degree (maximum degree of interactions) and 18 maximum terms, including intercept. 15 of 22 terms were used from 10 of the 16 original predictors. The 15 terms used include hinge functions and intercept.  The most important predictors for outstate appear to be expend, grad_rate, accept, and enroll.
+
+
+```{r partial dependence plot}
+# Present partial dependence plot of arbitrary predictor in final model
+partial_pred = pdp::partial(mars, pred.var = c("expend"),
+                  grid.resolution = 10) %>% 
+  autoplot(smooth = TRUE, ylab = expression(f(expend))) + 
+  theme_light()
+
+partial_pred
+
+```
+
+Here is the partial dependence plot: for the predictor  expend. For this predictor, we observe a single internal knot located at 14773, which mirrors that reported in the  MARS model summary generated previously. This means that as a college goes above the value 14773 on the expend metric, every additional unit of expend experiences decrease in outstate in comparison to that of colleges with less than 14773 in expend. 
+
+
+
+## Part D: Selecting a Model
+
+```{model selection}
+resamp = resamples(list(gam_final = gam,
+                        mars_final = mars))
+summary(resamp)
+bwplot(resamp, metric = "RMSE")
+```
+
+
+For this case, we would prefer the GAM model over the MARS model for predicting out of state tuition since the GAM model is slightly more effective at minimizing the RMSE, as shown in the plot above. 
+
+I think for general approach, the MARS model is more flexible than a linear model as it can capture nonlinear relationships between the input variables and the response variable. On the other hand, linear models are simpler and more interpretable than MARS, and they may be more appropriate when the relationships between input and output variables are linear or nearly linear. It depends on the data being used and what we are trying to do with the data. 
+
+
+
